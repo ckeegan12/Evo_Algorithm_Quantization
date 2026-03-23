@@ -3,29 +3,22 @@ import torch.nn as nn
 import copy
 import os
 import sys
-import zhwf_resnet20_actQ as resnet20
+from pathlib import Path
 
-# Define the 18 adder layer indices and their names
-ADDER_LAYER_INDICES = list(range(18))
-ADDER_LAYER_NAMES = [
-    "layer1.0.conv1.adder",    "layer1.0.conv2.adder",    "layer1.1.conv1.adder",    
-    "layer1.1.conv2.adder",    "layer1.2.conv1.adder",    "layer1.2.conv2.adder",
-    "layer2.0.conv1.adder",    "layer2.0.conv2.adder",    "layer2.1.conv1.adder",
-    "layer2.1.conv2.adder",    "layer2.2.conv1.adder",    "layer2.2.conv2.adder",
-    "layer3.0.conv1.adder",    "layer3.0.conv2.adder",    "layer3.1.conv1.adder",
-    "layer3.1.conv2.adder",    "layer3.2.conv1.adder",    "layer3.2.conv2.adder",
-]
-BN_LAYER_NAMES = [
-    "layer1.0.bn1",    "layer1.0.bn2",    "layer1.1.bn1",    "layer1.1.bn2",
-    "layer1.2.bn1",    "layer1.2.bn2",    "layer2.0.bn1",    "layer2.0.bn2",
-    "layer2.1.bn1",    "layer2.1.bn2",    "layer2.2.bn1",    "layer2.2.bn2",
-    "layer3.0.bn1",    "layer3.0.bn2",    "layer3.1.bn1",    "layer3.1.bn2",
-    "layer3.2.bn1",    "layer3.2.bn2",
-]
+_THIS_DIR = Path(__file__).resolve().parent
+_RESNET50_DIR = (_THIS_DIR.parent / 'AdderNet_models' / 'ResNet50').resolve()
+if str(_RESNET50_DIR) not in sys.path:
+    sys.path.insert(0, str(_RESNET50_DIR))
 
-# Add 'module.' prefix for DataParallel models
-ADDER_LAYER_NAMES_WITH_PREFIX = ["module." + name for name in ADDER_LAYER_NAMES]
-BN_LAYER_NAMES_WITH_PREFIX = ["module." + name for name in BN_LAYER_NAMES]
+import resnet50_actQ as resnet50
+
+# ResNet50 adder/BN lists are inferred from checkpoint dynamically.
+ADDER_LAYER_NAMES = []
+BN_LAYER_NAMES = []
+
+# Add 'module.' prefix for DataParallel models (filled after infer)
+ADDER_LAYER_NAMES_WITH_PREFIX = []
+BN_LAYER_NAMES_WITH_PREFIX = []
 
 # Quantization parameters
 Q = 4
@@ -54,120 +47,127 @@ def quantize_conv1_weight(w):
     
     return wq, delta_conv
 
-# Fine-grained clip values for each adder layer (per-layer control)
-# Represented as a simple array in the same order as ADDER_LAYER_NAMES.
-# If a layer is not specified, DEFAULT_CLIP_VALUE will be used.
-CLIP_VALUES_ARRAY = [
-    6.0,  # layer1.0.conv1.adder
-    6.0,  # layer1.0.conv2.adder
-    6.0,  # layer1.1.conv1.adder
-    6.0,  # layer1.1.conv2.adder
-    6.0,  # layer1.2.conv1.adder
-    6.0,  # layer1.2.conv2.adder
-    6.0,  # layer2.0.conv1.adder
-    6.0,  # layer2.0.conv2.adder
-    6.0,  # layer2.1.conv1.adder
-    6.0,  # layer2.1.conv2.adder
-    6.0,  # layer2.2.conv1.adder
-    6.0,  # layer2.2.conv2.adder
-    6.0,  # layer3.0.conv1.adder
-    6.0,  # layer3.0.conv2.adder
-    6.0,  # layer3.1.conv1.adder
-    6.0,  # layer3.1.conv2.adder
-    6.0,  # layer3.2.conv1.adder
-    6.0,  # layer3.2.conv2.adder
-]
-
-# Backwards-compatible mapping from layer name -> clip value
-CLIP_VALUES = {name: CLIP_VALUES_ARRAY[i] for i, name in enumerate(ADDER_LAYER_NAMES)}
+CLIP_VALUES_ARRAY = []
+CLIP_VALUES = {}
 
 # Input/Output paths
-MODEL_PATH = "models/ResNet20-AdderNet.pth"
-OUTPUT_PATH = "models/ResNet20-AdderNet-quantized.pth"
+MODEL_PATH = str((_RESNET50_DIR / 'ResNet50-AdderNet.pth').resolve())
+OUTPUT_PATH = str((_RESNET50_DIR / 'ResNet50-AdderNet-quantized.pth').resolve())
+
+
+def _extract_state_dict(loaded_obj):
+    if isinstance(loaded_obj, dict) and 'state_dict' in loaded_obj:
+        return loaded_obj['state_dict']
+    return loaded_obj
+
+
+def infer_adder_layer_names(state_dict):
+    names = set()
+    for key in state_dict.keys():
+        if key.endswith('.adder'):
+            clean = key[7:] if key.startswith('module.') else key
+            names.add(clean)
+    return sorted(list(names))
+
+
+def infer_bn_layer_names(adder_names):
+    names = []
+    for adder_name in adder_names:
+        try:
+            bn_name = get_bn_name_from_adder(adder_name)
+            if bn_name is not None and bn_name not in names:
+                names.append(bn_name)
+        except Exception:
+            continue
+    return names
+
+
+def initialize_layer_lists_from_state_dict(state_dict):
+    global ADDER_LAYER_NAMES, BN_LAYER_NAMES
+    global ADDER_LAYER_NAMES_WITH_PREFIX, BN_LAYER_NAMES_WITH_PREFIX
+    global CLIP_VALUES_ARRAY, CLIP_VALUES
+
+    ADDER_LAYER_NAMES = infer_adder_layer_names(state_dict)
+    BN_LAYER_NAMES = infer_bn_layer_names(ADDER_LAYER_NAMES)
+    ADDER_LAYER_NAMES_WITH_PREFIX = ['module.' + name for name in ADDER_LAYER_NAMES]
+    BN_LAYER_NAMES_WITH_PREFIX = ['module.' + name for name in BN_LAYER_NAMES]
+
+    CLIP_VALUES_ARRAY = [DEFAULT_CLIP_VALUE] * len(ADDER_LAYER_NAMES)
+    CLIP_VALUES = {name: CLIP_VALUES_ARRAY[i] for i, name in enumerate(ADDER_LAYER_NAMES)}
 
 
 def clip_values_to_relu_format(clip_values_dict, default_clip):
     """
-    Convert per-layer clip values to ReLU clip format (19 values for ResNet20).
-    ResNet20 has 19 ReLU layers:    
-    Each adder layer's clip value is used for both the subsequent ReLU outputs.    
+    Convert per-layer clip values to ReLU clip format (49 values for ResNet50).
+
+    ResNet50 (Bottleneck [3,4,6,3]) has 49 ReLU outputs used by resnet50_actQ:
+    - index 0: initial ReLU after stem conv1+bn1
+    - then 16 blocks * 3 ReLU outputs = 48 values (indices 1..48)
+
+    Mapping policy (input-activation driven):
+    - block.conv1 clip <- previous block output ReLU (or index 0 for first block)
+    - block.conv2 clip <- block relu1
+    - block.conv3 clip <- block relu2
+
+    Downsample adder layers are ignored for ReLU clip mapping.
     Args:
         clip_values_dict: Dict mapping adder layer name to clip value
         default_clip: Default clip value
     Returns:
-        List of 19 clip values for ReLU layers
+        List of 49 clip values for ReLU layers
     """
-    # Initialize all 19 ReLU clip values with default
-    relu_clip_values = [default_clip] * 19
-    
-    
-    # Create mapping: adder layer -> ReLU indices
-    # Map each adder layer to the corresponding ReLU index in the 19-entry clip_values list.
-    # ResNet expects clip_values formatted as: [initial_relu, layer1_block1_relu1, layer1_block1_relu2, ...]
-    # Therefore the first adder (layer1.0.conv1.adder) corresponds to ReLU index 0.
-    adder_to_relu = {
-        # Layer 1 (indices 0-5 in ReLU array)
-        "layer1.0.conv1.adder": (0,),    # initial ReLU -> input to layer1.0.conv1.adder
-        "layer1.0.conv2.adder": (1,),
-        "layer1.1.conv1.adder": (2,),
-        "layer1.1.conv2.adder": (3,),
-        "layer1.2.conv1.adder": (4,),
-        "layer1.2.conv2.adder": (5,),
-        # Layer 2 (indices 6-11)
-        "layer2.0.conv1.adder": (6,),
-        "layer2.0.conv2.adder": (7,),
-        "layer2.1.conv1.adder": (8,),
-        "layer2.1.conv2.adder": (9,),
-        "layer2.2.conv1.adder": (10,),
-        "layer2.2.conv2.adder": (11,),
-        # Layer 3 (indices 12-17)
-        "layer3.0.conv1.adder": (12,),
-        "layer3.0.conv2.adder": (13,),
-        "layer3.1.conv1.adder": (14,),
-        "layer3.1.conv2.adder": (15,),
-        "layer3.2.conv1.adder": (16,),
-        "layer3.2.conv2.adder": (17,),
-    }
-    
-    for adder_name, relu_indices in adder_to_relu.items():
-        clip_val = clip_values_dict.get(adder_name, default_clip)
-        for relu_idx in relu_indices:
-            if 0 <= relu_idx < 19:
-                relu_clip_values[relu_idx] = clip_val
-    
+    relu_clip_values = [default_clip] * 49
+    blocks_per_stage = [3, 4, 6, 3]
+
+    prev_relu_idx = 0
+    relu_counter = 1
+
+    for stage_idx, n_blocks in enumerate(blocks_per_stage, start=1):
+        for block_idx in range(n_blocks):
+            base = f'layer{stage_idx}.{block_idx}'
+            conv1_name = f'{base}.conv1.adder'
+            conv2_name = f'{base}.conv2.adder'
+            conv3_name = f'{base}.conv3.adder'
+
+            relu1_idx = relu_counter
+            relu2_idx = relu_counter + 1
+            relu3_idx = relu_counter + 2
+
+            relu_clip_values[prev_relu_idx] = clip_values_dict.get(conv1_name, relu_clip_values[prev_relu_idx])
+            relu_clip_values[relu1_idx] = clip_values_dict.get(conv2_name, relu_clip_values[relu1_idx])
+            relu_clip_values[relu2_idx] = clip_values_dict.get(conv3_name, relu_clip_values[relu2_idx])
+
+            prev_relu_idx = relu3_idx
+            relu_counter += 3
+
     return relu_clip_values
 
 
 def get_bn_name_from_adder(adder_name):
     """
-    Get the corresponding BN layer name from an adder layer name.
-    
+    Get the corresponding BN layer name from a ResNet50 adder layer name.
+
+    Supports:
+    - layerX.Y.conv1.adder -> layerX.Y.bn1
+    - layerX.Y.conv2.adder -> layerX.Y.bn2
+    - layerX.Y.conv3.adder -> layerX.Y.bn3
+    - layerX.Y.downsample.0.adder -> layerX.Y.downsample.1
     """
-    # The format is: layerX.Y.convZ.adder where X is layer group, Y is block index, Z is conv index
-    # Example: "layer1.0.conv1.adder" -> layer_path = "layer1.0", conv_name = "conv1"
     if adder_name.endswith('.adder'):
         base_name = adder_name[:-6]  # Remove '.adder' (6 characters)
     else:
         base_name = adder_name
-    
-    # Now base_name is like "layer1.0.conv1"
-    parts = base_name.split('.')
-    if len(parts) >= 2:
-        # Last part is conv1 or conv2
-        conv_part = parts[-1]  # e.g., "conv1"
-        layer_path = '.'.join(parts[:-1])  # e.g., "layer1.0"
-        
-        # Convert "conv1" to "bn1" or "conv2" to "bn2"
-        if "conv1" in conv_part:
-            bn_name = "bn1"
-        elif "conv2" in conv_part:
-            bn_name = "bn2"
-        else:
-            raise ValueError(f"Unknown conv part: {conv_part}")
-        
-        return f"{layer_path}.{bn_name}"
-    else:
-        raise ValueError(f"Invalid adder name format: {adder_name}")
+
+    if '.downsample.0' in base_name:
+        return base_name.replace('.downsample.0', '.downsample.1')
+    if '.conv1' in base_name:
+        return base_name.replace('.conv1', '.bn1')
+    if '.conv2' in base_name:
+        return base_name.replace('.conv2', '.bn2')
+    if '.conv3' in base_name:
+        return base_name.replace('.conv3', '.bn3')
+
+    raise ValueError(f"Invalid/unsupported adder name format: {adder_name}")
 
 
 def quantize_adder_weight(w, clip_val, Q=4):
@@ -192,7 +192,7 @@ def quantize_adder_weight(w, clip_val, Q=4):
     
     # Step 3: Quantization
     delta = clip_val / (2**Q - 1)
-    wq_nn = torch.round(w_nn / delta) * delta
+    wq_nn = w_nn.clone() if delta == 0 else torch.round(w_nn / delta) * delta
     
     return wq_nn, bias_sum
 
@@ -293,7 +293,7 @@ def apply_quantization_to_layer(state_dict, layer_name, clip_val, Q=4):
 
 def main():
     print("=" * 60)
-    print("Adder Layer Weight Quantization for ResNet20-AdderNet")
+    print("Adder Layer Weight Quantization for ResNet50-AdderNet")
     print("=" * 60)
     print(f"Quantization bits: {Q}")
     print(f"Default clip value: {DEFAULT_CLIP_VALUE}")
@@ -302,20 +302,23 @@ def main():
     print(f"Output model: {OUTPUT_PATH}")
     print()
     
+    # Create model instance
+    print("Loading model architecture...")
+    model = resnet50.resnet50(act_bits=Q)
+
+    # Load pretrained weights
+    print(f"Loading pretrained weights from {MODEL_PATH}...")
+    raw_loaded = torch.load(MODEL_PATH, map_location='cpu')
+    state_dict = _extract_state_dict(raw_loaded)
+
+    initialize_layer_lists_from_state_dict(state_dict)
+
     # Print all per-layer clip values
     print("Per-layer clip values:")
     for layer_name in ADDER_LAYER_NAMES:
         clip_val = CLIP_VALUES.get(layer_name, DEFAULT_CLIP_VALUE)
         print(f"  {layer_name}: {clip_val}")
     print()
-    
-    # Create model instance
-    print("Loading model architecture...")
-    model = resnet20.resnet20()
-    
-    # Load pretrained weights
-    print(f"Loading pretrained weights from {MODEL_PATH}...")
-    state_dict = torch.load(MODEL_PATH, map_location='cpu')
     
     # Print some info about the state dict
     print(f"Total keys in state dict: {len(state_dict)}")
@@ -336,9 +339,9 @@ def main():
     state_dict, conv1_delta = apply_conv1_quantization(state_dict)
     print()
     
-    # Step 2: Apply quantization to each of the 18 adder layers
+    # Step 2: Apply quantization to each adder layer
     print("=" * 60)
-    print("Step 2: Applying quantization to 18 adder layers...")
+    print(f"Step 2: Applying quantization to {len(ADDER_LAYER_NAMES)} adder layers...")
     print("=" * 60)
     
     for i, layer_name in enumerate(ADDER_LAYER_NAMES):
@@ -359,9 +362,9 @@ def main():
     print("Quantization complete!")
     print()
     
-    # Convert per-layer clip values to ReLU clip format (19 values)
+    # Convert per-layer clip values to ReLU clip format (49 values for ResNet50)
     relu_clip_values = clip_values_to_relu_format(CLIP_VALUES, DEFAULT_CLIP_VALUE)
-    print("ReLU clip values (19 total):")
+    print("ReLU clip values (49 total):")
     print(f"  {relu_clip_values}")
     print()
     
@@ -423,18 +426,18 @@ def load_quantized_model(model_path, clip_values_dict=None, default_clip=3.0):
         default_clip: Default clip value if not provided
     
     Returns:
-        model: ResNet20 model with clip values applied
+        model: ResNet50 model with clip values applied
     
     Example:
         # Load with custom clip values
         model = load_quantized_model(
-            "models/ResNet20-AdderNet-quantized.pth",
+            ".../ResNet50-AdderNet-quantized.pth",
             CLIP_VALUES,  # Your per-layer clip dict
             DEFAULT_CLIP_VALUE
         )
     
         # Or load with clip values saved in the model file
-        model = load_quantized_model("models/ResNet20-AdderNet-quantized.pth")
+        model = load_quantized_model(".../ResNet50-AdderNet-quantized.pth")
     """
     # Load the saved model
     saved_data = torch.load(model_path, map_location='cpu')
@@ -454,7 +457,10 @@ def load_quantized_model(model_path, clip_values_dict=None, default_clip=3.0):
         state_dict = saved_data
         print("Warning: Loading old format model (no clip metadata)")
     
-    # Convert per-layer clip values to ReLU format (19 values)
+    # If globals are not initialized yet, initialize from this checkpoint
+    initialize_layer_lists_from_state_dict(state_dict)
+
+    # Convert per-layer clip values to ReLU format (49 values)
     if clip_values_dict is None:
         clip_values_dict = CLIP_VALUES
     
@@ -462,8 +468,15 @@ def load_quantized_model(model_path, clip_values_dict=None, default_clip=3.0):
     
     print(f"Creating model with ReLU clip values: {relu_clip_values}")
     
+    q_bits = Q
+    if isinstance(saved_data, dict) and 'Q' in saved_data:
+        try:
+            q_bits = int(saved_data['Q'])
+        except Exception:
+            q_bits = Q
+
     # Create model with clip values
-    model = resnet20.resnet20(clip_values=relu_clip_values)
+    model = resnet50.resnet50(clip_values=relu_clip_values, act_bits=q_bits)
     
     # Load state dict - handle module prefix
     try:
