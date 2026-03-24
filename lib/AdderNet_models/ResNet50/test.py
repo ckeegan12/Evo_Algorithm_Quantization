@@ -20,7 +20,7 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
 parser.add_argument('--data_dir', type=str,
                     help='path to dataset',default="/cache/imagenet/val/")
 parser.add_argument('--model_dir', type=str,
-                    help='path to dataset',default="models/ResNet50-AdderNet.pth")
+                    help='path to dataset',default="lib/models/ResNet50-AdderNet.pth")
 best_acc1 = 0
 args, unparsed = parser.parse_known_args()
 

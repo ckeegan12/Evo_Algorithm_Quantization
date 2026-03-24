@@ -68,9 +68,18 @@ def validate(val_loader, model, device, max_batches=None, verbose=False):
 
 
 def load_checkpoint_state(model_path):
-    if not os.path.isfile(model_path):
-        raise FileNotFoundError(model_path)
-    checkpoint = torch.load(model_path, map_location='cpu')
+    # normalize path and support legacy "models/" by redirecting to "lib/models/"
+    resolved = model_path
+    if not os.path.isfile(resolved):
+        if model_path.startswith("models/"):
+            candidate = os.path.join("lib", model_path)  # models/x -> lib/models/x
+            if os.path.isfile(candidate):
+                resolved = candidate
+
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(resolved)
+
+    checkpoint = torch.load(resolved, map_location='cpu')
     state_dict = checkpoint.get('state_dict', checkpoint)
     # ensure module. prefix for consistency
     if not any(k.startswith('module.') for k in state_dict.keys()):
@@ -215,7 +224,7 @@ def main():
     parser = argparse.ArgumentParser(description='Optuna BO search for clip values')
     parser.add_argument('--trials', type=int, default=50)
     parser.add_argument('--q', type=int, default=4)
-    parser.add_argument('--model_path', type=str, default='models/ResNet50-AdderNet.pth')
+    parser.add_argument('--model_path', type=str, default='lib/models/ResNet50-AdderNet.pth')
     parser.add_argument('--n_proxy_batches', type=int, default=20, help='Number of validation batches per trial (proxy)')
     parser.add_argument('--batch_size', type=int, default=512)
     parser.add_argument('--storage', type=str, default=None, help='Optuna storage URL (optional)')

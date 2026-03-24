@@ -8,13 +8,17 @@ import torch
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import optuna
-
-from zhwf_resnet20_actQ import resnet20
-from zhwf_quantize_adder_weights import ADDER_LAYER_NAMES, apply_quantization_to_layer, clip_values_to_relu_format, DEFAULT_CLIP_VALUE
-from zhwf_stepbystep3_bo_search import load_checkpoint_state
-from contextlib import contextmanager
-import sys
-
+from datasets import load_dataset
+from torch.utils.data import IterableDataset, DataLoader
+# ResNet50-local imports (replace zhwf/resnet20 imports)
+from resnet50_actQ import resnet50
+from resnet50_quantize_adder_weights import (
+    ADDER_LAYER_NAMES,
+    apply_quantization_to_layer,
+    clip_values_to_relu_format,
+    DEFAULT_CLIP_VALUE,
+)
+from resnet50_stepbystep3_bo_search import load_checkpoint_state, objective_factory
 
 def quantize_conv1_and_fc(state_dict):
     try:
@@ -82,6 +86,54 @@ def accuracy(output, target):
         return (correct / target.size(0)) * 100.0
 
 
+class HFImageNetValIterable(IterableDataset):
+    def __init__(self, hf_iterable, transform):
+        self.hf_iterable = hf_iterable
+        self.transform = transform
+
+    def __iter__(self):
+        for ex in self.hf_iterable:
+            img = ex["image"]
+            label = ex.get("label", ex.get("labels"))
+            if label is None or img is None:
+                continue
+
+            # Ensure 3-channel input for ImageNet normalization
+            try:
+                if hasattr(img, "convert"):
+                    img = img.convert("RGB")
+            except Exception:
+                continue
+
+            yield self.transform(img), int(label)
+
+
+def make_imagenet_val_loader(args, device):
+    val_tf = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.485, 0.456, 0.406),
+                             std=(0.229, 0.224, 0.225)),
+    ])
+
+    hf_val = load_dataset(
+        "ILSVRC/imagenet-1k",
+        split="validation",
+        streaming=True,  
+    )
+
+    val_ds = HFImageNetValIterable(hf_val, val_tf)
+    return DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+    )
+
+
 def validate(val_loader, model, device, max_batches=None, verbose=False):
     meter = AverageMeter()
     model.eval()
@@ -89,46 +141,43 @@ def validate(val_loader, model, device, max_batches=None, verbose=False):
         for i, (input, target) in enumerate(val_loader):
             if max_batches is not None and i >= max_batches:
                 break
-            if device.type == 'cuda':
-                input = input.to(device, non_blocking=True)
-                target = target.to(device, non_blocking=True)
-                torch.cuda.synchronize()
-                start_evt = torch.cuda.Event(enable_timing=True)
-                end_evt = torch.cuda.Event(enable_timing=True)
-                start_evt.record()
-                output = model(input)
-                end_evt.record()
-                torch.cuda.synchronize()
-                batch_time = start_evt.elapsed_time(end_evt)
-            else:
-                input = input.to(device)
-                target = target.to(device)
-                start = time.perf_counter()
-                output = model(input)
-                batch_time = (time.perf_counter() - start) * 1000.0
+            if input.ndim != 4 or input.size(1) != 3:
+                continue
+            input = input.to(device, non_blocking=False)
+            target = target.to(device, non_blocking=False)
+            output = model(input)
             acc1 = accuracy(output, target)
             meter.update(acc1, input.size(0))
-            if verbose:
-                print(f'Batch {i}: Avg Acc@1: {meter.avg:.3f}, Time: {batch_time:.2f}ms')
     return meter.avg
+
+
+def build_resnet50_model(q, relu_clip_values, device):
+    """
+    Build ResNet50 quantized model with robust argument handling.
+    Keeps stepbystep4 functionality while adapting to ResNet50 signatures.
+    """
+    # Preferred: per-layer act bit list
+    act_bits_list = [int(q)] * max(1, len(ADDER_LAYER_NAMES))
+
+    model = None
+    try:
+        model = resnet50(clip_values=relu_clip_values, act_bits=act_bits_list)
+    except TypeError:
+        try:
+            model = resnet50(clip_values=relu_clip_values, act_bits=int(q))
+        except TypeError:
+            model = resnet50()
+
+    model = torch.nn.DataParallel(model).to(device)
+    return model
 
 
 def run_coordinate_descent(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    val_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10(
-            './data_cifar10/', train=False, download=True,
-            transform=transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-            ])
-        ),
-        batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=(device.type=='cuda')
-    )
+    val_loader = make_imagenet_val_loader(args, device)
 
     per_dim_pass = {name: [] for name in ADDER_LAYER_NAMES}
-    per_dim_best = {name: (None, -1.0) for name in ADDER_LAYER_NAMES}  # (value, acc)
-
+    per_dim_best = {name: (None, -1.0) for name in ADDER_LAYER_NAMES}
     values = np.arange(args.min_val, args.max_val + 1e-9, args.step)
 
     for idx, layer_name in enumerate(ADDER_LAYER_NAMES):
@@ -151,9 +200,7 @@ def run_coordinate_descent(args):
             quantize_bn_params(state_dict)
 
             relu_clip_values = clip_values_to_relu_format({layer_name: v_rounded}, DEFAULT_CLIP_VALUE)
-            act_bits_list = [int(args.q)] * 19
-            model = resnet20(clip_values=relu_clip_values, act_bits=act_bits_list)
-            model = torch.nn.DataParallel(model).to(device)
+            model = build_resnet50_model(args.q, relu_clip_values, device)
             model.load_state_dict(state_dict, strict=False)
 
             acc = validate(val_loader, model, device, max_batches=args.n_proxy_batches, verbose=False)
@@ -164,41 +211,14 @@ def run_coordinate_descent(args):
             if acc > per_dim_best[layer_name][1]:
                 per_dim_best[layer_name] = (v_rounded, acc)
 
-    # save results
     out = {
-        'per_dim_pass': per_dim_pass,
-        'per_dim_best': {k: {'value': v[0], 'acc': v[1]} for k, v in per_dim_best.items()}
+        "per_dim_pass": per_dim_pass,
+        "per_dim_best": {k: {"value": v[0], "acc": v[1]} for k, v in per_dim_best.items()},
     }
-    with open(args.output_json, 'w') as f:
+    with open(args.output_json, "w") as f:
         json.dump(out, f, indent=2)
-    print('Coordinate descent done. Results saved to', args.output_json)
+    print("Coordinate descent done. Results saved to", args.output_json)
     return per_dim_pass, per_dim_best
-
-
-def build_seeds(per_dim_pass, per_dim_best, n_seeds=5):
-    seeds = []
-    # seed 0: best per-dim
-    seed0 = []
-    for name in ADDER_LAYER_NAMES:
-        best = per_dim_best.get(name, (None, -1.0))[0]
-        if best is None:
-            seed0.append(DEFAULT_CLIP_VALUE)
-        else:
-            seed0.append(best)
-    seeds.append(seed0)
-
-    # other seeds: random combination from passing sets (fallback to best or default)
-    for s in range(1, n_seeds):
-        seed = []
-        for name in ADDER_LAYER_NAMES:
-            vals = per_dim_pass.get(name, [])
-            if vals:
-                seed.append(float(random.choice(vals)))
-            else:
-                best = per_dim_best.get(name, (None, -1.0))[0]
-                seed.append(best if best is not None else DEFAULT_CLIP_VALUE)
-        seeds.append(seed)
-    return seeds
 
 
 def enqueue_seeds_and_run_cma(args, seeds):
@@ -222,19 +242,9 @@ def enqueue_seeds_and_run_cma(args, seeds):
         except Exception:
             pass
 
-    # objective uses the same machinery as existing script: reuse its objective_factory
-    from zhwf_stepbystep3_bo_search import objective_factory
+    # objective uses ResNet50 stepbystep3 machinery
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    val_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10(
-            './data_cifar10/', train=False, download=True,
-            transform=transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-            ])
-        ),
-        batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=(device.type=='cuda')
-    )
+    val_loader = make_imagenet_val_loader(args, device)
     objective = objective_factory(args.model_path, device, val_loader, args.q, args.n_proxy_batches)
 
     def _obj(trial):
@@ -244,19 +254,56 @@ def enqueue_seeds_and_run_cma(args, seeds):
     print('CMA-ES finished. Best trial:', study.best_trial.params, 'value:', study.best_value)
 
 
+def build_seeds(per_dim_pass, per_dim_best, n_seeds=5):
+    """
+    Build CMA-ES seed vectors from CD outputs.
+    Mirrors stepbystep4 seed behavior:
+      - Seed 0: deterministic anchor from pass-list median (fallback best/default)
+      - Remaining seeds: random picks from pass-lists (fallback best/default)
+    """
+    layer_names = list(ADDER_LAYER_NAMES)
+    rng = np.random.default_rng(42)
+
+    # deterministic anchor seed
+    anchor = []
+    for name in layer_names:
+        passed_vals = per_dim_pass.get(name, [])
+        if passed_vals:
+            anchor.append(float(np.median(np.array(passed_vals, dtype=float))))
+        else:
+            best_val = per_dim_best.get(name, (None, -1.0))[0]
+            anchor.append(float(best_val) if best_val is not None else float(DEFAULT_CLIP_VALUE))
+
+    seeds = [anchor]
+
+    # randomized seeds
+    for _ in range(max(0, int(n_seeds) - 1)):
+        seed = []
+        for name in layer_names:
+            passed_vals = per_dim_pass.get(name, [])
+            if passed_vals:
+                seed.append(float(rng.choice(np.array(passed_vals, dtype=float))))
+            else:
+                best_val = per_dim_best.get(name, (None, -1.0))[0]
+                seed.append(float(best_val) if best_val is not None else float(DEFAULT_CLIP_VALUE))
+        seeds.append(seed)
+
+    return seeds
+
+
 def main():
-    parser = argparse.ArgumentParser(description='CD -> CMA-ES pipeline for clip search')
-    parser.add_argument('--model_path', type=str, default='models/ResNet20-AdderNet.pth')
+    parser = argparse.ArgumentParser(description='CD -> CMA-ES pipeline for ResNet50 clip search')
+    parser.add_argument('--model_path', type=str, default='lib/models/ResNet50-AdderNet.pth')
     parser.add_argument('--q', type=int, default=4)
     parser.add_argument('--n_proxy_batches', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--min_val', type=float, default=1.0)
     parser.add_argument('--max_val', type=float, default=3.5)
     parser.add_argument('--step', type=float, default=0.1)
-    parser.add_argument('--threshold', type=float, default=90.0, help='proxy accuracy threshold (percent) to keep values per-dim')
-    parser.add_argument('--output_json', type=str, default='cd_results.json')
-    parser.add_argument('--storage', type=str, default=None, help='Optuna storage URI (sqlite:///...)')
-    parser.add_argument('--study_name', type=str, default='cmaes_from_cd')
+    parser.add_argument('--threshold', type=float, default=90.0)
+    parser.add_argument('--output_json', type=str, default='cd_results_resnet50.json')
+    parser.add_argument('--storage', type=str, default=None)
+    parser.add_argument('--study_name', type=str, default='resnet50_cmaes_from_cd')
     parser.add_argument('--cma_trials', type=int, default=200)
     parser.add_argument('--seeds', type=int, default=5)
     args = parser.parse_args()
